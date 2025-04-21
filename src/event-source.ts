@@ -11,24 +11,63 @@ import {
 import { wait } from "./internal";
 import { getBytes, messageListFromString, type SseMessage } from "./parse";
 
+// Lazy-load the WASM polyfill for Brotli in older browsers
+const brotliWasmPromise: Promise<typeof import('brotli-wasm')> = import('brotli-wasm');
+
+/**
+ * Decompresses a Brotli-compressed, base64-encoded string to UTF-8.
+ * Supports native browser DecompressionStream (with cast) and falls back to brotli-wasm.
+ */
+async function decompressBrotliData(base64String: string): Promise<string> {
+    // Decode Base64 to raw binary string
+    const binary = typeof atob === 'function'
+      ? atob(base64String)
+      : Buffer.from(base64String, 'base64').toString('binary');
+    // Convert to Uint8Array
+    const compressedBytes = new Uint8Array(
+      Array.from(binary, (c) => c.charCodeAt(0))
+    );
+  
+    // Browser environment with native DecompressionStream
+    if (typeof DecompressionStream === 'function') {
+      const ds = new (DecompressionStream as any)('brotli');
+      const decompressedStream = new Response(compressedBytes).body!.pipeThrough(ds);
+      const reader = decompressedStream.getReader();
+      const decoder = new TextDecoder();
+      let result = '';
+      // Explicitly type the reader to match the expected chunk type
+      let chunk: ReadableStreamReadResult<Uint8Array>;
+      while (!(chunk = await reader.read() as ReadableStreamReadResult<Uint8Array>).done) {
+        result += decoder.decode(chunk.value, { stream: true });
+      }
+      result += decoder.decode();
+      return result;
+    }
+  
+    // Fallback to WASM-based Brotli polyfill
+    try {
+      const brotliWasm = await brotliWasmPromise;
+      const decompress = brotliWasm.decompress;
+      const decompressedBytes = decompress(compressedBytes);
+      return new TextDecoder().decode(decompressedBytes);
+    } catch (_err) {
+      // continue to throw below
+    }
+  
+    throw new Error('Brotli decompression is not supported in this environment');
+}
+
 export const EventStreamContentType = "text/event-stream";
 const LastEventIdHeader = "last-event-id";
 
 export class EventSourcePlus {
     url: string;
-
     lastEventId: string | undefined;
-
     options: EventSourcePlusOptions;
-
     retryCount = 0;
-
     retryInterval = 0;
-
     maxRetryCount: number | undefined;
-
     maxRetryInterval: number;
-
     fetch: $Fetch;
 
     constructor(url: string, options: EventSourcePlusOptions = {}) {
@@ -154,7 +193,31 @@ export class EventSourcePlus {
 
     listen(hooks: EventSourceHooks): EventSourceController {
         const controller = new EventSourceController(new AbortController());
-        void this._handleConnection(controller, hooks);
+        const wrappedHooks: EventSourceHooks = {
+          ...hooks,
+          onMessage: (message) => {
+            const data = message.data;
+            if (typeof data === 'string' && data.startsWith("br:")) {
+              decompressBrotliData(data.slice(3))
+                .then((decompressed) => {
+                  message.data = decompressed;
+                  hooks.onMessage(message);
+                })
+                .catch((err) => {
+                  console.error("Failed to decompress Brotli message:", err);
+                  hooks.onMessage(message);
+                });
+            } else {
+              hooks.onMessage(message);
+            }
+          },
+          onRequest: hooks.onRequest,
+          onRequestError: hooks.onRequestError,
+          onResponse: hooks.onResponse,
+          onResponseError: hooks.onResponseError,
+        };
+    
+        void this._handleConnection(controller, wrappedHooks);
         return controller;
     }
 }

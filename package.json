@@ -37,6 +37,7 @@
     "author": "Joshua Sosso (@joshmossas)",
     "license": "MIT",
     "dependencies": {
+        "brotli-wasm": "^3.0.1",
         "ofetch": "^1.4.1"
     },
     "devDependencies": {
